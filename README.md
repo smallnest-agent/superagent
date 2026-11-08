@@ -82,6 +82,17 @@ the GitHub notification poller, the Feishu Source, worktree creation per ticket,
 agent's report back to the conversation. The Feishu path is proven with a stand-in `lark-cli`; a live check against a real
 Feishu app is not done yet.
 
+## Install once
+
+```sh
+pnpm build
+mkdir ~/superagent && cd ~/superagent
+/path/to/superagent-skill/bin/superagent.js init   # writes settings.yaml here
+```
+
+`checkout` names the repository the tickets change, and `executor.agent` names the coding agent. Both `github` and
+`feishu` are optional, but at least one must be on.
+
 ## Tests
 
 ```sh
