@@ -85,9 +85,16 @@ Feishu app is not done yet.
 ## Install once
 
 ```sh
-pnpm build
-mkdir ~/superagent && cd ~/superagent
-/path/to/superagent-skill/bin/superagent.js init   # writes settings.yaml here
+npm install -g superagent-skill
+superagent init ~/my-superagent && cd ~/my-superagent
+superagent doctor
+```
+
+From a checkout instead, build it and link it yourself:
+
+```sh
+pnpm install && pnpm build
+ln -sf "$PWD/bin/superagent.js" ~/.local/bin/superagent   # a directory on PATH
 ```
 
 Start the loop from that directory: `superagent poll` keeps running, and `superagent poll --once` runs one round, which
