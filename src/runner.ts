@@ -347,10 +347,13 @@ export async function runLoop(options: LoopOptions): Promise<void> {
   // message is pushed. So the consumer does not wait for them: an empty bot id matches every mention, and a message read
   // before the ids arrive is matched with what they are once they do. A failure is logged once, not once per round.
   let identity = Promise.resolve({ appId: '', botId: '' })
-  let identityFailed = false
+  let read = false
   const identify = (): void => {
+    // Read once per run: the ids do not change, and the stream goes on matching with what it has.
+    if (read) return
+    read = true
     identity = botIdentity(feishu!.cli, [...new Set([...chats.keys(), ...feishu!.syncChat ? [feishu!.syncChat] : []])], signal).catch(error => {
-      if (!signal.aborted && !identityFailed) { identityFailed = true; log(`Could not read the bot's ids: ${(error as Error).message}`) }
+      if (!signal.aborted) log(`Could not read the bot's ids: ${(error as Error).message}`)
       return { appId: '', botId: '' }
     })
   }
