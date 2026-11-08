@@ -1,9 +1,9 @@
 # superagent configuration for this repository. State and worktrees stay out of
 # git; the file itself is kept here so an installation is one checkout.
 
-stateDir: /Users/smallnest/superagent/.superagent
+stateDir: /Users/smallnest/ai/superagent-skill/.superagent
 # Tickets get a worktree of this repository and open their pull requests here.
-checkout: /Users/smallnest/superagent-skill
+checkout: /Users/smallnest/ai/superagent-skill
 
 github:
   enabled: true
