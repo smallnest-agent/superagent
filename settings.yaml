@@ -26,7 +26,7 @@ feishu:
 executor:
   agent: claude
   streamIdleMs: 300
-  maxWorkers: 1
+  maxWorkers: 5
   timeoutMinutes: 60
   prepare: ""
   blockedCommands: []
