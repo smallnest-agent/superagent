@@ -66,6 +66,12 @@ export interface Executor {
   deliver(ticket: Ticket, assignment: Assignment): void
   /** End an assignment's work, such as cancelling its Session's turn; called after the ticket or assignment has already ended in the domain. */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void
+  /**
+   * Take in a ticket that moved outside this Engine's memory, such as a report the Executor could not send while no
+   * command of this Engine ran. A loop that keeps one Engine across commands calls this first; one that loads the
+   * repositories and makes a new Engine for each command needs nothing.
+   */
+  refresh?(ticket: Ticket): void
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */

@@ -2,6 +2,7 @@
  * Proves one poll round end to end with a stand-in `gh` and a stand-in agent, so the test needs no network and no model:
  * a mention becomes a Trigger, the Trigger becomes a ticket, the ticket runs, and its report comes back.
  */
+import { execFileSync } from 'node:child_process'
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,6 +10,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { FileRepositories } from '../src/state/files.ts'
 import { SettingsSchema } from '../src/settings.ts'
 import { runLoop } from '../src/runner.ts'
+import { ticketBranch } from '../src/infra/worktree.ts'
 
 const dirs: string[] = []
 afterAll(async () => { await Promise.all(dirs.map(dir => rm(dir, { recursive: true, force: true }))) })
@@ -57,6 +59,8 @@ describe('a poll round', () => {
     const repo = new FileRepositories(settings.stateDir)
     await repo.open()
 
+    await initRepository(root)
+
     // The fake agent is a Codex stand-in: the Codex runner reads its last message file and the report file.
     await runLoop({ settings, repo, signal: new AbortController().signal, log: () => {}, once: true })
     await new Promise(resolve => setTimeout(resolve, 400))
@@ -68,6 +72,13 @@ describe('a poll round', () => {
 
     const triggers = [...repo.keys()].filter(name => name.startsWith('trigger:'))
     expect(triggers.length).toBeGreaterThan(0)
+
+    // The ticket ran in its own worktree, on a branch of its own, so it cannot disturb the operator's checkout.
+    const branch = ticketBranch(settings.branchPrefix, tickets[0]!.title, tickets[0]!.id)
+    const current = execFileSync('git', ['-C', join(settings.stateDir, 'work', tickets[0]!.id), 'rev-parse', '--abbrev-ref', 'HEAD']).toString().trim()
+    expect(current).toBe(branch)
+    const parent = execFileSync('git', ['-C', join(settings.stateDir, 'work', tickets[0]!.id), 'rev-parse', 'HEAD']).toString().trim()
+    expect(parent).toBe(execFileSync('git', ['-C', root, 'rev-parse', 'HEAD']).toString().trim())
 
     // A second round records the report the agent wrote and ends the ticket with it.
     await runLoop({ settings, repo, signal: new AbortController().signal, log: () => {}, once: true })
@@ -113,6 +124,13 @@ describe('a poll round', () => {
     expect(repo.tickets.list()).toHaveLength(1)
   }, 30_000)
 })
+
+/** A checkout with one commit, which a ticket branches from. */
+function initRepository(directory: string): void {
+  const git = (...args: string[]): void => { execFileSync('git', ['-C', directory, ...args], { stdio: 'ignore' }) }
+  git('init', '-q')
+  git('-c', 'user.email=a@example.com', '-c', 'user.name=A', 'commit', '-q', '--allow-empty', '-m', 'initial')
+}
 
 /** Reads a file the loop wrote, failing the test with the path when it is missing. */
 export async function readOr(path: string): Promise<string> {

@@ -1,3 +1,99 @@
+function deliver(engine: Engine, repo: FileRepositories, delivered: Set<string>, log: (line: string) => void): void {
+  for (const ticket of repo.tickets.list()) {
+    const report = latestReport(ticket)
+    // A ready report ends its ticket, so the conversation that asked gets its answer once the ticket is no longer live.
+    if (!ticket.ended || report?.state !== 'ready' || delivered.has(`${ticket.id}@${report.at}`)) continue
+    delivered.add(`${ticket.id}@${report.at}`)
+    const text = String(report.summary).trim() || 'The work is done.'
+    try {
+      engine.reply({ purpose: 'result', ticketId: ticket.id, text })
+      log(`Answered ticket ${ticket.id} in its conversation`)
+    } catch (error) {
+      log(`Could not answer ticket ${ticket.id}: ${(error as Error).message}`)
+    }
+  }
+}
+
+/** Decides the requests the assessor accepted, which starts their tickets. */
+function advance(engine: Engine, repo: FileRepositories, log: (line: string) => void, candidates: Candidate[]): void {
+  for (const candidate of candidates) {
+    const trigger = repo.triggers.get(candidate.triggers[0]!.id)
+    if (!trigger) continue
+    const name = trigger.text.split('\n')[0]!.replace(/@[\w-]+/g, '').trim().slice(0, 60) || 'Request'
+    try {
+      const decision = engine.decide(trigger.id, { kind: 'accept', title: name, scope: name, reason: 'explicit' } as AssessmentOutcome)
+      log(`Accepted ${trigger.id} as ticket ${decision.ticketId ?? '(none)'}`)
+    } catch (error) {
+      log(`Could not accept ${trigger.id}: ${(error as Error).message}`)
+    }
+  }
+}
+
+/** The outcome of a finished agent turn, which a round records on the Engine. */
+type Finished = { ticketId: string; report: { state: string; summary: string; question?: string | null } }
+
+/** Holds the turns' outcomes until a round records them, and wakes that round when one arrives. */
+class TurnQueue {
+  private readonly items: Finished[] = []
+  handoff: ((item: Finished) => void) | undefined
+  private waiter: (() => void) | undefined
+  /** A turn that finished; it is kept even with no round waiting, so a turn that outlives its round is still recorded. */
+  push(item: Finished): void { this.items.push(item); this.handoff?.(item); this.wake() }
+  /** The turns finished since the last drain. */
+  drain(): Finished[] { return this.items.splice(0) }
+  /** Whether a turn is waiting to be recorded. */
+  ready(): boolean { return this.items.length > 0 }
+  /** Settles when a turn has finished, or when `ms` passes. */
+  wait(ms: number): Promise<void> {
+    if (this.items.length) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      const finish = (): void => { clearTimeout(timer); this.waiter = undefined; resolve() }
+      const timer = setTimeout(finish, ms)
+      this.waiter = finish
+    })
+  }
+  private wake(): void { this.waiter?.() }
+}
+
+/** How long one round waits for a turn before the next round; a turn is recorded when it ends, not several rounds later. */
+const TURN_WAIT_MS = 1000
+/** Records the turns that finished, so a ticket ends without the loop holding work in memory; a refused report is logged, not thrown. */
+function record(engine: Engine, repo: FileRepositories, finished: Finished[], log: (line: string) => void): void {
+  for (const item of finished) {
+    // A report the Engine refuses, such as one for a ticket a person already stopped, must not stop the others.
+    try {
+      // The ticket in the Engine's memory may be older than the one on disk: the agent's turn takes minutes, and other
+      // rounds wrote to the disk in between.
+      const latest = repo.tickets.get(item.ticketId)
+      if (latest) engine.updateTicket(latest)
+      engine.report(item.ticketId, { state: item.report.state as 'ready', summary: item.report.summary,
+        ...item.report.question ? { question: item.report.question } : {} })
+    } catch (error) { log(`Could not record the report for ${item.ticketId}: ${(error as Error).message}`) }
+  }
+}
+
+/** Posts the messages the Engine queued, one comment per message. */
+async function send(channel: Outbox & { drain: () => OutboundMessage[] }, clis: { github?: string; feishu?: string }, log: (line: string) => void): Promise<void> {
+  for (const message of channel.drain()) {
+    if (message.channel.source === 'feishu') {
+      const address = message.channel.address as { chatId?: string; messageId?: string }
+      if (!clis.feishu) { log(`Cannot answer in ${address.chatId}: the Feishu Source is off`); continue }
+      try {
+        await reply(clis.feishu, address.messageId!, message.text, message.id)
+        log(`Answered in ${address.chatId}`)
+      } catch (error) { log(`Could not answer in ${address.chatId}: ${(error as Error).message}`) }
+      continue
+    }
+    const address = message.channel.address as { repository?: string; number?: string }
+    if (!address.number || !address.repository) continue
+    if (!clis.github) { log(`Cannot post on ${address.repository}#${address.number}: the GitHub Source is off`); continue }
+    try {
+      await run(clis.github, ['api', `repos/${address.repository}/issues/${address.number}/comments`, '-f', `body=${message.text}`])
+      log(`Posted a message on ${address.repository}#${address.number}`)
+    } catch (error) { log(`Could not post on ${address.repository}#${address.number}: ${(error as Error).message}`) }
+  }
+}
+
 /**
  * The loop that makes an installation run without a person: poll the Sources, assess what they bring, and run the tickets
  * the assessment accepts.
@@ -8,7 +104,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Engine, type AssessmentOutcome, type Candidate, type Executor, type Outbox, type OutboundMessage, type Policy, type Assessor, type SourceScope,
-  type Ticket, type Trigger, type Assignment } from './core/index.ts'
+  type Ticket, type Trigger, type Assignment, latestReport, liveTicket } from './core/index.ts'
 import { runnerFor, type AgentName, type AgentReport, type AgentRunner } from './agents/index.ts'
 import { writeEnvironment, runEnvironment, type EnvironmentAccounts } from './infra/environment.ts'
 import { run } from './infra/commands.ts'
@@ -16,6 +112,8 @@ import type { FileRepositories } from './state/files.ts'
 import type { Settings } from './settings.ts'
 import { composePrompt } from './prompts.ts'
 import { agentLogin, pollNotifications } from './sources/github.ts'
+import { botIdentity, chatMembers, consumeEvents, feishuTrigger, reply, type StreamHandle } from './sources/feishu.ts'
+import { prepareWorktree, ticketBranch } from './infra/worktree.ts'
 import { sameName } from './infra/text.ts'
 
 /** Where the loop keeps its own bookkeeping, beside the domain state. */
@@ -26,9 +124,11 @@ const seenKey = (id: string) => `github:seen:${id}`
 function sourceScope(settings: Settings): SourceScope {
   return {
     scope: input => {
+      if (input.source === 'feishu') return settings.feishu?.enabled ? { listened: true, observed: false } : { listened: false, reason: 'sourceOff' }
       if (input.source !== 'github') return { listened: false, reason: 'unsupported' }
-      const repository = (input.meta.repository as string | undefined) ?? settings.github?.repository
-      if (!repository || !settings.github?.enabled) return { listened: false, reason: 'sourceOff' }
+      if (!settings.github?.enabled) return { listened: false, reason: 'sourceOff' }
+      const repository = (input.meta.repository as string | undefined) ?? settings.github.repository
+      if (!repository) return { listened: false, reason: 'unsupported' }
       if (!sameName(repository, settings.github.repository)) return { listened: false, reason: 'otherRepository' }
       return { listened: true, observed: false }
     },
@@ -37,18 +137,21 @@ function sourceScope(settings: Settings): SourceScope {
 
 /** A Policy that admits a person on the allow list who addressed the agent, and nothing else. */
 function buildPolicy(settings: Settings): Policy {
+  // Each Source has its own list: a GitHub login and a Feishu open id never match, and one list would admit neither.
   const allowed = new Set((settings.github?.allowed ?? []).map(name => name.toLowerCase()))
-  const version = String(allowed.size)
+  const people = new Set((settings.feishu?.allowed ?? []).map(id => id.toLowerCase()))
+  const version = `${allowed.size}.${people.size}`
   return {
     version,
     paused: false,
     gate: trigger => {
       if (!trigger.human) return { admissible: false, reason: 'bot' }
-      if (!allowed.has(trigger.actor.id.toLowerCase())) return { admissible: false, reason: 'notAllowed' }
+      if (!(trigger.source === 'feishu' ? people : allowed).has(trigger.actor.id.toLowerCase())) return { admissible: false, reason: 'notAllowed' }
       if (!trigger.addressed) return { admissible: false, reason: 'notAddressed' }
       return { admissible: true, strength: 'explicit', basis: { via: 'listed', addressed: 'mention' } }
     },
-    revalidate: mandate => mandate.basis.via !== 'bot' && allowed.has(mandate.actor.id.toLowerCase()),
+    // The list an accept leaned on is the one that still has to hold; the Mandate names its actor's Source.
+    revalidate: mandate => mandate.basis.via !== 'bot' && (mandate.actor.source === 'feishu' ? people : allowed).has(mandate.actor.id.toLowerCase()),
     admitsInferred: () => false,
     evalTimeoutMs: 120_000,
   } as Policy
@@ -57,6 +160,10 @@ function buildPolicy(settings: Settings): Policy {
 /** Marks a request accepted without a model call: an explicit mention by an allowed person is its own authorization. */
 const explicitAssessor: Assessor = { request: candidate => { accepted.push(candidate) }, release: () => {} }
 const accepted: Candidate[] = []
+/** How long a round waits for the event stream to connect before it starts without it. */
+const STREAM_CONNECT_MS = 3000
+/** Lines one round reads from the stream at most, so a chat that keeps talking does not hold a round open. */
+const MAX_LINES = 500
 
 /** A failed save of the last round must not stop the next one. */
 function outbox(): Outbox {
@@ -85,14 +192,23 @@ class AgentExecutor implements Executor {
     repository: string
     agent: string
     accounts: EnvironmentAccounts
+    /** The Feishu CLI that acts as the bot, when the Feishu Source is on; its shim goes into the agent's environment. */
+    feishuCli?: string
+    engine: Engine
     site: { started(ticketId: string, assignmentId: string): void; reported(ticketId: string, report: { state: string; summary: string; question?: string | null }): void
       failed(ticketId: string, assignmentId: string, summary: string): void }
-    prompt: (ticket: Ticket, directory: string) => Promise<string>
+    prompt: (ticket: Ticket, directory: string, branch?: string) => Promise<string>
   }) {}
 
   start(ticket: Ticket, assignment: Assignment): void {
     const controller = new AbortController()
+    // The start is the fact the round records; recording it inside the start keeps the running state from R1 from
+    // outliving the start in the order R2 reads it, because the engine's memory is the last word a round sees.
+    const { site } = this.options
+    site.started(ticket.id, assignment.id)
     this.active.set(ticket.id, controller)
+    // The turn begins after the current round: the round records "started" first, so the report then lands on the running
+    // assignment instead of on one the Engine has not been told about yet.
     void this.execute(ticket, assignment, controller)
   }
 
@@ -100,23 +216,27 @@ class AgentExecutor implements Executor {
     // A ticket runs one turn at a time; a message that arrives mid-turn is read at the next start.
   }
 
+  /** The Engine's memory of the ticket, so the report lands on a ticket that already holds this round's changes to it. */
+  refresh(ticket: Ticket): void { this.options.engine.updateTicket(ticket) }
+
   stop(ticket: Ticket): void {
     this.active.get(ticket.id)?.abort()
     this.active.delete(ticket.id)
   }
 
   private async execute(ticket: Ticket, assignment: Assignment, controller: AbortController): Promise<void> {
-    const { settings, runner, stateDir, accounts, site } = this.options
+    const { settings, runner, stateDir, accounts, feishuCli, site } = this.options
     const directory = ticket.execution?.directory ?? join(stateDir, 'work', ticket.id)
     try {
-      await mkdir(directory, { recursive: true })
-      if (settings.executor.prepare) await run('/bin/sh', ['-c', settings.executor.prepare], { env: this.variables(ticket, directory), timeoutMs: 120_000 })
-      site.started(ticket.id, assignment.id)
-      const prompt = await this.options.prompt(ticket, directory)
+      // Each ticket gets its own branch off the checkout's HEAD, so tickets never share a working tree or a branch.
+      const branch = ticketBranch(settings.branchPrefix, ticket.title, ticket.id)
+      await prepareWorktree({ checkout: settings.checkout, directory, branch, signal: controller.signal })
+      if (settings.executor.prepare) await run('/bin/sh', ['-c', settings.executor.prepare], { env: this.variables(ticket, directory, branch), timeoutMs: 120_000 })
+      const prompt = await this.options.prompt(ticket, directory, branch)
       const result = await runner.run({
         prompt,
         cwd: directory,
-        env: runEnvironment(accounts, this.variables(ticket, directory)),
+        env: runEnvironment(feishuCli ? { ...accounts, feishuCli } : accounts, this.variables(ticket, directory, branch)),
         signal: controller.signal,
         timeoutMs: settings.executor.timeoutMinutes * 60_000,
         model: settings.executor.model,
@@ -129,11 +249,12 @@ class AgentExecutor implements Executor {
     } finally { this.active.delete(ticket.id) }
   }
 
-  private variables(ticket: Ticket, directory: string): Record<string, string> {
+  private variables(ticket: Ticket, directory: string, branch: string): Record<string, string> {
     const trigger = ticket.origin
     return {
       SUPERAGENT_TICKET: ticket.id,
       SUPERAGENT_DIR: directory,
+      SUPERAGENT_BRANCH: branch,
       SUPERAGENT_REPOSITORY: this.options.repository,
       SUPERAGENT_TRIGGER: trigger.triggerId,
       DSH_SUPERAGENT_DIR: directory,
@@ -155,7 +276,7 @@ async function appendLog(directory: string, prompt: string, raw: string, report:
   const path = join(directory, '.superagent', 'log.md')
   const entry = ['', `## ${new Date().toISOString()}`, '', '**Report**', '', '```json', JSON.stringify(report, null, 2), '```', '', '**Agent output**', '', '```', raw, '```'].join('\n')
   const previous = await readFile(path, 'utf8').catch(() => '')
-  await writeFile(path, `${previous}${entry}\n`).catch(() => {})
+  await mkdir(join(directory, '.superagent'), { recursive: true }).then(() => writeFile(path, `${previous}${entry}\n`))
 }
 
 export interface LoopOptions {
@@ -169,17 +290,22 @@ export interface LoopOptions {
 
 /** Runs rounds until `signal` aborts; each round polls, assesses, and starts the tickets accepted. */
 export async function runLoop(options: LoopOptions): Promise<void> {
-  const { settings, repo, signal, log } = options
-  const github = settings.github
-  if (!github?.enabled) throw new Error('The GitHub Source is off in settings.yaml; nothing to poll.')
-  const login = await agentLogin(github.cli, signal)
-  const accounts: EnvironmentAccounts = { stateDir: settings.stateDir, githubCli: github.cli, agentLogin: login }
+  // A round on demand ends by itself: the event stream stops with the last round, so the caller's process can exit.
+  const { settings, repo, signal: caller, log } = options
+  const stop = new AbortController()
+  if (!options.once) caller.addEventListener('abort', () => stop.abort(), { once: true })
+  const signal = stop.signal
+  const github = settings.github?.enabled ? settings.github : undefined
+  const feishu = settings.feishu?.enabled ? settings.feishu : undefined
+  if (!github && !feishu) throw new Error('No Source is on in settings.yaml; nothing to poll.')
+  const login = github ? await agentLogin(github.cli, signal) : ''
+  // Without a GitHub Source the shims point at nothing usable; every GitHub action then fails inside the run, which is right.
+  const accounts = { stateDir: settings.stateDir, githubCli: github?.cli ?? 'gh', agentLogin: login } as EnvironmentAccounts
   await writeEnvironment(accounts, settings.executor.blockedCommands)
 
   const channel = outbox() as Outbox & { drain: () => OutboundMessage[] }
-  const pending: Array<{ ticketId: string; report: { state: string; summary: string; question?: string | null } }> = []
-  const failures: Array<{ ticketId: string; summary: string }> = []
-  const started: Array<{ ticketId: string; assignmentId: string }> = []
+  // Finished turns wait here for a round to record them, and wake the loop's idle wait so it happens at once.
+  const finished = new TurnQueue()
 
   const engine = new Engine({
     repo,
@@ -190,93 +316,165 @@ export async function runLoop(options: LoopOptions): Promise<void> {
     outbox: channel,
   })
   const executor = new AgentExecutor({
-    settings, runner: runnerFor(settings.executor.agent as AgentName, settings.executor.binary), stateDir: settings.stateDir,
-    repository: github.repository, agent: login, accounts,
+    engine, settings, runner: runnerFor(settings.executor.agent as AgentName, settings.executor.binary), stateDir: settings.stateDir,
+    repository: github?.repository ?? settings.checkout, agent: login, accounts, ...feishu ? { feishuCli: feishu.cli } : {},
     site: {
-      started: (ticketId, assignmentId) => started.push({ ticketId, assignmentId }),
-      reported: (ticketId, report) => pending.push({ ticketId, report }),
-      failed: (ticketId, _assignmentId, summary) => failures.push({ ticketId, summary }),
+      started: (ticketId, assignmentId) => engine.assignmentStarted(ticketId, assignmentId),
+      reported: (ticketId, report) => finished.push({ ticketId, report }),
+      failed: (ticketId, _assignmentId, summary) => finished.push({ ticketId, report: { state: 'failed', summary } }),
     },
-    prompt: async (ticket, directory) => {
+    prompt: async (ticket, directory, branch) => {
       const trigger = repo.triggers.get(ticket.origin.triggerId)
-      return composePrompt({ ticket, trigger, repository: github.repository, agentLogin: login, branchPrefix: settings.branchPrefix,
-        instructions: settings.prompts })
+      const source = trigger?.source === 'feishu' ? 'feishu' as const : 'github' as const
+      return composePrompt({ ticket, trigger, repository: github?.repository ?? settings.checkout, agentLogin: login, branchPrefix: settings.branchPrefix,
+        source, instructions: settings.prompts, branch })
     },
   })
-  // The Engine takes its Executor at construction and the Executor reports back through the Engine, so the two are joined here.
+  // `syncChat` copies a chat's members into the allow list each round, so a person joins by joining the chat. The list
+  // grows in the Engine's memory only: a restart reads it from settings again and the sync adds them back.
+  const admitted = new Set<string>()
+  const sync = (): Promise<void> => !feishu?.syncChat ? Promise.resolve() : chatMembers(feishu.cli, feishu.syncChat, signal)
+    .then(members => {
+      const listed = feishu.allowed.map(id => id.toLowerCase())
+      const add = members.map(member => member.id).filter(id => !listed.includes(id.toLowerCase()) && !admitted.has(id.toLowerCase()))
+      if (add.length) { feishu.allowed.push(...add); for (const id of add) admitted.add(id.toLowerCase()); log(`Admitted ${add.length} member(s) of ${feishu.syncChat} from its chat`) }
+    })
+    .catch(error => { if (!signal.aborted) log(`Could not read the members of ${feishu.syncChat}: ${(error as Error).message}`) })
+  await sync()
+  // Feishu pushes events, so the stream runs beside the rounds; it only stores what it receives, and a round decides.
+  const chats = new Map((feishu?.chats ?? []).map(chat => [chat.chatId, false] as const))
+  // The bot's own ids make a mention match, but reading them takes a CLI call, and the stream must be listening before a
+  // message is pushed. So the consumer does not wait for them: an empty bot id matches every mention, and a message read
+  // before the ids arrive is matched with what they are once they do. A failure is logged once, not once per round.
+  let identity = Promise.resolve({ appId: '', botId: '' })
+  let identityFailed = false
+  const identify = (): void => {
+    identity = botIdentity(feishu!.cli, signal).catch(error => {
+      if (!signal.aborted && !identityFailed) { identityFailed = true; log(`Could not read the bot's ids: ${(error as Error).message}`) }
+      return { appId: '', botId: '' }
+    })
+  }
+  const store = (trigger: Trigger): void => {
+    // Stored at once rather than in a round, so a message that arrives while a round waits for its interval is not lost.
+    try {
+      const cur = options.repo
+          const result = repo.atomic(() => engine.receive(trigger))
+      // A round flushes the disk itself; flushing here while a round reads would rewrite this file after the message was
+      // taken, and the next round would read it as a new one.
+      if (result !== 'duplicate') log(`Received ${trigger.id} from ${trigger.actor.id} on ${trigger.threads[0]!.id}`)
+    } catch (error) { log(`Could not store ${trigger.id}: ${(error as Error).message}`) }
+  }
+  const receive = (event: unknown): void => {
+    void identity.then(bot => feishuTrigger(event, { botAppId: bot.appId, botId: bot.botId, chats, directMessages: feishu?.directMessages ?? true,
+      onInvalid: error => log(`Ignored an event: ${error}`) }))
+      .then(trigger => { if (trigger) store(trigger) })
+      .catch(error => { log(`Could not store an event: ${(error as Error).message}`) })
+  }
+  // A consumer runs for the whole round loop, not for one round: Feishu pushes a message to the stream, and a stream that
+  // stops and starts between rounds drops what is sent while it is down. The rounds read what it stored between their steps.
+  let handle: StreamHandle | undefined
+  const stopListening = new AbortController()
+  const unlisten = (): void => { stopListening.abort() }
+  const endStream = async (): Promise<void> => {
+    unlisten()
+    if (handle) await handle.ended
+  }
+  if (feishu) {
+    handle = consumeEvents({ cli: feishu.cli, signal: stopListening.signal,
+      onMessage: receive,
+      onListening: (started) => { handle = started },
+      // A consumer that could not start is a warning for the log; one that ends with an error is a line in the log, and the
+      // next round starts another.
+      onError: message => { if (!signal.aborted) log(message) },
+    })
+  }
+  /** Waits for the stream's next line: a line that arrives settles it, and a stream that answers nothing is idle. */
+  const nextLine = (): Promise<boolean> => handle ? handle.next(settings.executor.streamIdleMs) : Promise.resolve(false)
+  const delivered = new Set<string>()
+  // The Engine takes its Executor at construction and the Executor reports back through the Engine, so the two are joined
+  // here. A turn that finished while no round is listening is also recorded from here: a turn lasts several rounds of a
+  // loop that runs one round at a time, and the round that hears of it may never reach its own record step.
   ;(engine as unknown as { options: { executor: Executor } }).options.executor = executor
+  finished.handoff = item => {
+    try { record(engine, repo, [item], log) } catch (error) { log(`Could not record the report for ${item.ticketId}: ${(error as Error).message}`) }
+  }
 
+  // Triggers a round has taken: they stay on disk as history, and the Engine's memory keeps that they were taken.
+  const inRound = new Set<string>()
+  // Rounds read the state from disk, so a message stored by the stream has to be moved into the Engine's memory first.
+  const ingest = (): void => {
+    const waiting = repo.triggers.list().filter(trigger => trigger.source === 'feishu')
+    // Stored triggers stay on disk as history, so the Engine's own duplicate check is what skips the ones already taken.
+    for (const trigger of waiting) { inRound.add(trigger.id); engine.receive(trigger) }
+  }
   let since = (repo.getMeta<string>(pollKey) ?? new Date().toISOString())
+  // Reads what the stream sent during a round, so a message that arrives while a round works is not lost. A consumer that
+  // has not started yet answers at once, and the round goes on with what the state has.
+  const pull = async (): Promise<void> => {
+    if (!feishu) return
+    // Bounded: a chat that keeps talking must not keep one round going, since the next round reads the rest.
+    for (let lines = 0; lines < MAX_LINES && !signal.aborted; lines++) {
+      // The `await` is first on purpose: `x && await y()` never calls `y` when `x` is true.
+      if (!await nextLine()) break
+    }
+    if (signal.aborted) return
+    ingest()
+    await repo.reload()
+  }
   while (!signal.aborted) {
     const round = new Date().toISOString()
     try {
+      if (feishu) identify()
+      // Ingested before the reload, so this round decides on a message that arrived during it; the next round sees the rest.
+      ingest()
       await repo.reload()
-      const triggers = await pollNotifications({
-        cli: github.cli, repository: github.repository, agent: login, since, signal,
-        seen: id => repo.getMeta<boolean>(seenKey(id)) === true,
-        mark: id => repo.setMeta(seenKey(id), true),
-      })
-      for (const trigger of triggers) {
-        const result = engine.receive(trigger)
-        if (result !== 'duplicate') log(`Received ${trigger.id} from ${trigger.actor.id} on ${trigger.threads[0]!.id}`)
+      await pull()
+      if (github) {
+        const triggers = await pollNotifications({
+          cli: github.cli, repository: github.repository, agent: login, since, signal,
+          seen: id => repo.getMeta<boolean>(seenKey(id)) === true,
+          mark: id => repo.setMeta(seenKey(id), true),
+        })
+        for (const trigger of triggers) {
+          const result = engine.receive(trigger)
+          if (result !== 'duplicate') log(`Received ${trigger.id} from ${trigger.actor.id} on ${trigger.threads[0]!.id}`)
+        }
+        since = round
+        repo.setMeta(pollKey, since)
       }
-      since = round
-      repo.setMeta(pollKey, since)
       // The Engine queues an Eval per new thread; running it hands the candidate to the assessor, which accepts it.
       engine.evaluateDue()
       advance(engine, repo, log, accepted.splice(0))
-      settle(engine, { pending, failures, started })
+      record(engine, repo, finished.drain(), log)
+      // A line that arrives while an agent runs is stored by its handler, so `flush` writes it with the round.
       await repo.flush()
-      await send(channel, github.cli, log)
+      await pull()
+      inRound.clear()
+      // The report goes back to where the person asked before any other message, so the answer reads as the outcome.
+      deliver(engine, repo, delivered, log)
       await repo.flush()
+      await send(channel, { ...github ? { github: github.cli } : {}, ...feishu ? { feishu: feishu.cli } : {} }, log)
+      await repo.flush()
+      await sync()
     } catch (error) {
       if (!signal.aborted) log(`Round failed: ${(error as Error).message}\n${(error as Error).stack?.split('\n').slice(1, 4).join('\n')}`)
     }
-    if (options.once) return
-    await new Promise<void>(resolve => {
-      const timer = setTimeout(resolve, github.pollSeconds * 1000)
-      signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
-    })
-  }
-}
-
-/** Decides the requests the assessor accepted, which starts their tickets. */
-function advance(engine: Engine, repo: FileRepositories, log: (line: string) => void, candidates: Candidate[]): void {
-  for (const candidate of candidates) {
-    const trigger = repo.triggers.get(candidate.triggers[0]!.id)
-    if (!trigger) continue
-    const name = trigger.text.split('\n')[0]!.replace(/@[\w-]+/g, '').trim().slice(0, 60) || 'Request'
-    try {
-      const decision = engine.decide(trigger.id, { kind: 'accept', title: name, scope: name, reason: 'explicit' } as AssessmentOutcome)
-      log(`Accepted ${trigger.id} as ticket ${decision.ticketId ?? '(none)'}`)
-    } catch (error) {
-      log(`Could not accept ${trigger.id}: ${(error as Error).message}`)
+    if (options.once) break
+    // A turn that ends during the wait is recorded by the next round, which starts at once instead of at the interval;
+    // a GitHub Source with a longer interval waits in the same way, and the Source's own timer adds nothing to it.
+    const seconds = Math.min(github?.pollSeconds ?? Infinity, feishu ? 15 : Infinity)
+    let left = seconds * 1000
+    while (left > 0 && !signal.aborted) {
+      const began = Date.now()
+      await Promise.race([finished.wait(Math.max(1, Math.min(TURN_WAIT_MS, left))),
+        new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))])
+      // A turn woke the wait: the round it woke starts now, and the Sources are read as early as they can be.
+      if (finished.ready()) break
+      left -= Date.now() - began
     }
   }
-}
-
-/** Records the reports finished agent turns produced, so a ticket ends without the loop holding work in memory. */
-async function settle(engine: Engine, state: { pending: Array<{ ticketId: string; report: { state: string; summary: string; question?: string | null } }>
-  failures: Array<{ ticketId: string; summary: string }>; started: Array<{ ticketId: string; assignmentId: string }> }): Promise<void> {
-  for (const item of state.started.splice(0)) engine.assignmentStarted(item.ticketId, item.assignmentId)
-  for (const item of state.failures.splice(0)) engine.report(item.ticketId, { state: 'failed', summary: item.summary })
-  for (const item of state.pending.splice(0)) {
-    engine.report(item.ticketId, { state: item.report.state as 'ready', summary: item.report.summary,
-      ...item.report.question ? { question: item.report.question } : {} })
-  }
-}
-
-/** Posts the messages the Engine queued, one comment per message. */
-async function send(channel: Outbox & { drain: () => OutboundMessage[] }, cli: string, log: (line: string) => void): Promise<void> {
-  const queued = channel.drain()
-  if (!queued.length) return
-  const channelOf = (message: OutboundMessage): { repository?: string; number?: string } => message.channel.address as { repository?: string; number?: string }
-  for (const message of queued) {
-    const address = channelOf(message)
-    if (!address.number || !address.repository) continue
-    try {
-      await run(cli, ['api', `repos/${address.repository}/issues/${address.number}/comments`, '-f', `body=${message.text}`])
-      log(`Posted a message on ${address.repository}#${address.number}`)
-    } catch (error) { log(`Could not post on ${address.repository}#${address.number}: ${(error as Error).message}`) }
-  }
+  // The stream stops with the rounds, and on its own signal: the caller's aborts the whole run, and the consumer ends in
+  // its own time, so the process that started it can exit after its last round.
+  stop.abort()
+  if (feishu) await endStream()
 }

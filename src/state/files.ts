@@ -19,7 +19,7 @@
  * process and buffers file writes until the outermost transaction commits, so a failed unit of work leaves no trace.
  */
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { threadKey, type Decision, type Repositories, type Thread, type Ticket, type Trigger, type TriggerDisposition } from '../core/index.ts'
 
 const encode = (value: string): string => Buffer.from(value).toString('base64url')
@@ -53,7 +53,7 @@ export class FileRepositories implements Repositories {
     }
     for (const name of await read('threads')) {
       const value = await load(join(this.stateDir, 'threads', name))
-      if (value) all.set(`thread:${name.replace(/\.json$/, '')}`, value)
+      if (value) all.set(`thread:${decode(name.replace(/\.json$/, ''))}`, value)
     }
     for (const name of await read('decisions')) {
       const value = await load(join(this.stateDir, 'decisions', name))
@@ -80,8 +80,14 @@ export class FileRepositories implements Repositories {
     this.disk = all
   }
 
-  /** Reloads what other processes wrote; a long-running poller calls this between rounds. */
-  async reload(): Promise<void> { await this.refresh() }
+  /**
+   * Writes every change and re-reads every file, so a reader in this process sees what other writers stored and other
+   * processes see what this one did. A long-running poller calls this between rounds.
+   */
+  async reload(): Promise<void> {
+    await this.flush()
+    await this.refresh()
+  }
 
   // Paths
 
@@ -110,12 +116,15 @@ export class FileRepositories implements Repositories {
     this.disk.set(logical, JSON.parse(op.value))
   }
 
-  /** The in-memory name a file path maps to, matching the names `refresh` builds. */
+  /**
+   * The in-memory name a file path maps to, matching the names `refresh` builds. Files at the top of a directory are named
+   * after their key alone, so their name is the encoded key; a trigger sits one directory deeper, under a thread.
+   */
   private logicalKey(op: Op): string {
     const [kind, ...rest] = op.path.split('/')
     const name = rest.join('/').replace(/\.json$/, '')
     if (kind === 'tickets') return `ticket:${rest[0]}`
-    if (kind === 'threads') return `thread:${decode(name)}`
+    if (kind === 'threads') return `thread:${decode(basename(name))}`
     if (kind === 'decisions') return `decision:${decode(name)}`
     if (kind === 'outbox') return `outbox:${decode(name)}`
     if (kind === 'meta') return `meta:${decode(name)}`
@@ -149,7 +158,12 @@ export class FileRepositories implements Repositories {
       if (outer) {
         const ops = this.pending.splice(0)
         this.depth = 0
-        this.queue = this.queue.then(() => this.commit(ops)).catch(() => {})
+        const previous = this.queue
+        // A reload that read the files before this commit would otherwise leave a reader without what the commit wrote.
+        this.queue = previous.then(() => this.commit(ops)).then(() => {
+          if (previous !== this.queue) return
+          for (const op of ops) this.apply(op)
+        }).catch(() => {})
       } else { this.depth-- }
       return value
     } catch (error) {
@@ -159,8 +173,14 @@ export class FileRepositories implements Repositories {
     }
   }
 
-  /** Resolves once every committed write has reached disk. Call before the process exits. */
-  async flush(): Promise<void> { await this.queue }
+  /**
+   * Commits every buffered write and waits for the earlier ones. Call before the process exits. A write made outside a
+   * transaction, such as the loop's cursor, waits here too.
+   */
+  async flush(): Promise<void> {
+    if (this.pending.length) this.queue = this.queue.then(() => this.commit(this.pending.splice(0))).catch(() => {})
+    await this.queue
+  }
 
   // Repositories
 
@@ -170,6 +190,7 @@ export class FileRepositories implements Repositories {
       const at = trigger.at.replace(/[:.]/g, '-')
       this.write(join(this.triggerDir(threadKey(trigger.threads[0]!)), `${at}-${encode(trigger.id)}.json`), trigger)
     },
+    list: (): Trigger[] => { const all: Trigger[] = []; for (const [name, value] of this.disk) if (name.startsWith('trigger:')) all.push(value as Trigger); return all },
     disposition: (id: string): TriggerDisposition | undefined => this.findMeta<TriggerDisposition>(`disposition:${id}`),
     saveDisposition: (id: string, value: TriggerDisposition): void => this.write(join('meta', `${encode(`disposition:${id}`)}.json`), value),
   }

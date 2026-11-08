@@ -227,6 +227,15 @@ export class Engine {
   handback(ticketId: string, triggerId: string, reason: string): boolean {
     return this.repo.atomic(() => this.evals.handback(ticketId, triggerId, reason))
   }
+  /** Takes in a ticket that a command of this Engine did not write, such as one reloaded from the disk between commands. */
+  updateTicket(ticket: Ticket): void {
+    this.repo.atomic(() => {
+      // A newer record on disk wins, so a report never rolls back a ticket that moved on between the reload and now.
+      const live = this.repo.tickets.get(ticket.id)
+      if (!live || live.updatedAt <= ticket.updatedAt) this.repo.tickets.save(ticket)
+    })
+  }
+
   /**
    * Record a report on an open ticket's current Assignment. Its question for a person (`attention`) is asked, kept, or
    * cleared (`null` or a `ready` report), and a replaced attention question whose reply has not been sent yet is withdrawn
@@ -236,7 +245,15 @@ export class Engine {
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.assignments.report(ticketId, report)
+      // A report written while no round was listening leaves its launched Assignment unread in the memory of an older
+      // round; telling this round's Executor the turn ended refreshes its view before `evaluateDue` and `advance` run.
+      this.options.executor.refresh?.(ticket)
+      return ticket
+    })
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its

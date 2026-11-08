@@ -17,6 +17,8 @@ const ExecutorSchema = z.object({
   binary: z.string().optional(),
   /** The model argument, when the agent takes one. */
   model: z.string().optional(),
+  /** How long a round waits for the event stream to send its first line, since a push may arrive at once. */
+  streamIdleMs: z.number().int().min(1).max(60_000).default(300),
   /** How many tickets may run at once. */
   maxWorkers: z.number().int().min(1).max(16).default(1),
   /** A ticket that runs longer than this is stopped. */

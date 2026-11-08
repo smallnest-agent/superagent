@@ -1,0 +1,246 @@
+/**
+ * The Feishu Source: a bot listens in chats, and a message that mentions it, or a direct message, becomes a Trigger.
+ *
+ * Feishu pushes events, so the Source reads the bot's long-lived event stream rather than polling. That stream is one
+ * process (`lark-cli event consume`); `consumeEvents` runs it and hands each message to a callback.
+ *
+ * A chat is listened to only when `settings.feishu.chats` names it, because a bot in a busy chat sees everything and a
+ * Trigger per message would cost the team attention for nothing.
+ */
+import { spawn, type ChildProcess } from 'node:child_process'
+import { z } from 'zod'
+import { key, type ChannelRef, type ThreadRef, type Trigger } from '../core/index.ts'
+import { run, runJson } from '../infra/commands.ts'
+
+export const SOURCE = 'feishu'
+/** The event the Feishu bot subscribes to: a message sent to it or in a chat it is in. */
+export const MESSAGE_EVENT = 'mc.eqtqdhm.rhhfmrf_e3'
+export const feishuThread = (chatId: string, rootId: string | undefined, messageId: string): ThreadRef =>
+  ({ source: SOURCE, id: `${chatId}:${rootId ?? messageId}` })
+/** Where a reply to this message goes; `direct` is explicit because group and direct chat ids both start with `oc_`. */
+export const feishuChannel = (chatId: string, messageId: string, direct = false): ChannelRef =>
+  ({ source: SOURCE, thread: `feishu:${chatId}`, address: { chatId, messageId, ...direct ? { direct: 'true' } : {} } })
+
+/** One message as the event stream prints it. */
+export const EventSchema = z.object({
+  // The stream nests the sender in `sender`: the real event carries both shapes, so either is accepted.
+  message_id: z.string(),
+  chat_id: z.string(),
+  chat_type: z.enum(['p2p', 'group']),
+  sender_id: z.string().optional(),
+  sender_type: z.enum(['user', 'bot']).optional(),
+  sender: z.object({ sender_id: z.string(), sender_type: z.enum(['user', 'bot']) }).optional(),
+  content: z.string(),
+  create_time: z.string(),
+  mentions: z.array(z.object({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).default([]),
+  root_id: z.string().optional(),
+  parent_id: z.string().optional(),
+  message_app_link: z.string().optional(),
+})
+export type FeishuEvent = z.infer<typeof EventSchema>
+
+/** Feishu sends epoch milliseconds as a string for live events; anything else is passed to `Date`. */
+export function feishuTime(value: string): string {
+  const time = /^\d+$/.test(value) ? Number(value) : Date.parse(value)
+  if (!Number.isFinite(time)) throw new Error(`Unreadable Feishu message time: ${value}`)
+  return new Date(time).toISOString()
+}
+
+/** Replaces Feishu's mention placeholders with the names a reader expects, so the agent sees "@bot fix this". */
+export function withMentionNames(text: string, mentions: FeishuEvent['mentions']): string {
+  return mentions.reduce((result, mention) => mention.key && mention.name ? result.replaceAll(mention.key, `@${mention.name}`) : result, text)
+}
+
+/** Builds a Trigger for one message, or `undefined` when the bot wrote it or the chat is not listened to. */
+export function feishuTrigger(input: unknown, options: {
+  botId: string
+  botAppId: string
+  /** Chat ids the Source listens to, mapped to whether the chat is a direct chat. */
+  chats: ReadonlyMap<string, boolean>
+  directMessages: boolean
+  /** Receives the line the event did not match, so a parse failure is visible instead of silent. */
+  onInvalid?: (error: string) => void
+}): Trigger | undefined {
+  const parsed = EventSchema.safeParse(input)
+  if (!parsed.success) { options.onInvalid?.(parsed.error.message); return undefined }
+  const event = parsed.data
+  const { botId, botAppId, chats, directMessages } = options
+  const senderId = event.sender_id ?? event.sender?.sender_id ?? ''
+  const senderType = event.sender_type ?? event.sender?.sender_type ?? 'user'
+  if (senderId === botId || senderId === botAppId) return undefined
+  const direct = event.chat_type === 'p2p'
+  if (direct ? !directMessages : !chats.has(event.chat_id)) return undefined
+  // Feishu reports the bot in a mention as its own id; the open id needs a chat to read, so an unknown one still matches.
+  const mentioned = event.mentions.some(mention => !botId || mention.id === botId || mention.id === botAppId)
+  // In a group the bot hears only what is addressed to it; a message about something else is not a request.
+  if (!direct && !mentioned) return undefined
+  const url = event.message_app_link
+  return {
+    id: key('feishu', event.message_id),
+    source: SOURCE,
+    threads: [feishuThread(event.chat_id, event.root_id, event.message_id)],
+    actor: { source: SOURCE, id: senderId },
+    human: senderType === 'user',
+    ...(direct ? { addressed: 'direct' as const } : { addressed: 'mention' as const }),
+    at: feishuTime(event.create_time),
+    text: withMentionNames(event.content, event.mentions),
+    channel: feishuChannel(event.chat_id, event.message_id, direct),
+    ...url ? { url } : {},
+    meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...event.root_id ? { rootId: event.root_id } : {} },
+  }
+}
+
+/** The bot's own ids, which the Source needs to recognise a mention and to skip its own messages. */
+export async function botIdentity(cli: string, signal?: AbortSignal): Promise<{ appId: string; botId: string }> {
+  const status = await runJson<{ appId: string }>(cli, ['config', 'show'], { signal })
+  // The bot's open id is the `bot_id` that `im chat.members bots` reports for a chat it is in; without a chat, the stream still works.
+  let botId = ''
+  try {
+    const chats = await runJson<{ chats?: Array<{ chat_id: string }> }>(cli, ['im', '+chat-list', '--page-all'], { signal })
+    const first = chats.chats?.[0]?.chat_id
+    if (first) {
+      const bots = await runJson<{ bots?: Array<{ bot_id: string }> }>(cli, ['im', 'chat.members', 'bots', '--params', JSON.stringify({ chat_id: first })], { signal })
+      botId = bots.bots?.[0]?.bot_id ?? ''
+    }
+  } catch { /* a bot with no chat yet can still receive direct messages */ }
+  return { appId: status.appId, botId }
+}
+
+/** The members of a chat, which fill the allow list when `settings.feishu.syncChat` names it. */
+export async function chatMembers(cli: string, chatId: string, signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+  const result = await runJson<{ users?: Array<{ member_id: string; name?: string }> }>(cli,
+    ['im', '+chat-members-list', '--chat-id', chatId, '--member-types', 'user', '--page-all', '--page-limit', '0'], { signal })
+  return (result.users ?? []).map(user => ({ id: user.member_id, name: user.name ?? user.member_id }))
+}
+
+/** Posts a reply in the thread of `messageId`, which is where the person who asked is reading. */
+export async function reply(cli: string, messageId: string, text: string, idempotencyKey: string, signal?: AbortSignal): Promise<void> {
+  await run(cli, ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', idempotencyKey], { signal })
+}
+
+/** A small JSON reader for the event stream, which tolerates what other commands print before or between events. */
+export class EventReader {
+  private rest = ''
+  private readonly read: (line: string) => void
+  private readonly failed: (line: string) => void
+  constructor(read: (line: string) => void, failed: (line: string) => void) { this.read = read; this.failed = failed }
+
+  /** Hands every complete line in `chunk` to the reader, and keeps the rest until the next chunk completes it. */
+  push(chunk: string): void {
+    this.rest += chunk
+    const lines = this.rest.split('\n')
+    this.rest = lines.pop()!
+    for (const line of lines) if (line.trim()) this.line(line)
+  }
+
+  /** Reads what is left when the stream ends. */
+  flush(): void {
+    const line = this.rest.trim()
+    this.rest = ''
+    if (line) this.line(line)
+  }
+
+  private line(line: string): void {
+    try {
+      const value: unknown = JSON.parse(line)
+      if (value && typeof value === 'object' && !Array.isArray(value)) this.read(line)
+    } catch { this.failed(line) }
+  }
+}
+
+/** How long a stop leaves the consumer to end on its own before it is killed. */
+const STOP_GRACE_MS = 1000
+
+/** What a round does with the stream: waits for its next line, stops it, and waits for it to end. */
+export interface StreamHandle {
+  next(ms: number): Promise<boolean>
+  stop(): void
+  /** Settles when the consumer has ended and every line it printed has reached `onMessage`. */
+  ended: Promise<void>
+}
+
+/**
+ * Runs `lark-cli event consume` and hands every message to `onMessage`.
+ *
+ * The child exits when its stdin closes, so this keeps stdin open for the life of the run and closes it to stop. The
+ * consumer also refuses to start while another process holds the app's event connection, which is why one installation
+ * should use its own Feishu app.
+ *
+ * The reader collects whole lines only and hands each to `onMessage` as it reads it. A round waits on `next`, which is
+ * settled in the same tick as a line is handed over, so no line is lost between the wait and the read; a line that
+ * arrives with the close answers one last `next`, and after the close `next` is false at once.
+ */
+export function consumeEvents(options: {
+  cli: string
+  signal: AbortSignal
+  onMessage: (event: unknown) => void
+  onError: (message: string) => void
+  /** Called once the consumer has started; it prints nothing until a message arrives, so this is the sign it is listening. */
+  onListening?: (handle: StreamHandle) => void
+}): StreamHandle {
+  const failed = (line: string): void => { options.onError(`Unreadable event: ${line.slice(0, 200)}`) }
+  let linesRead = 0
+  const reader = new EventReader(line => { options.onMessage(JSON.parse(line)); linesRead++ }, failed)
+  let waiting: { resolve: (line: boolean) => void; timer: NodeJS.Timeout } | undefined
+  let closing = false
+  let finished = false
+  const unwait = (): void => {
+    const waiter = waiting
+    if (!waiter) return
+    clearTimeout(waiter.timer)
+    waiting = undefined
+    waiter.resolve(true)
+  }
+  const next = (ms: number): Promise<boolean> => {
+    if (closing || finished) return Promise.resolve(false)
+    // A line read since the last `next` was handed over in that tick, and this call starts in a later one.
+    if (linesRead) { linesRead = 0; return Promise.resolve(true) }
+    return new Promise<boolean>(resolve => {
+      waiting = { resolve, timer: setTimeout(() => { waiting = undefined; resolve(false) }, ms) }
+    })
+  }
+  let child: ChildProcess | undefined
+  let settled!: () => void
+  const ended = new Promise<void>(resolve => { settled = resolve })
+  const stop = (): void => {
+    if (!child || finished) return
+    // Closing stdin is how the consumer is meant to end. A kill can reach the shell before it prints, so it is only the
+    // fallback for a consumer that has not ended after the grace time.
+    if (!child.stdin!.destroyed) child.stdin!.end()
+    const late = setTimeout(() => { finished = true; child!.kill('SIGTERM'); unwait(); settled() }, STOP_GRACE_MS)
+    late.unref()
+  }
+  child = spawn(options.cli, ['event', 'consume', MESSAGE_EVENT, '--as', 'bot'],
+    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+  child.stdout!.on('data', (chunk: Buffer) => {
+    reader.push(chunk.toString())
+    unwait()
+  })
+  child.stderr!.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString().split('\n')) if (/WARN|error/i.test(line)) options.onError(line.slice(0, 400))
+  })
+  child.on('spawn', () => {
+    if (options.signal.aborted) stop()
+    else options.onListening?.({ next, stop, ended })
+  })
+  child.on('error', error => {
+    if (!finished) options.onError(String(error))
+    finished = true
+    unwait()
+    settled()
+  })
+  child.on('close', code => {
+    if (!finished) {
+      // The lines it printed are stored by their handlers first; `next` still answers true for the last of them.
+      reader.flush()
+      if (code !== 0) options.onError(`The event consumer exited with code ${code}`)
+    }
+    finished = true
+    closing = true
+    unwait()
+    settled()
+  })
+  options.signal.addEventListener('abort', stop, { once: true })
+  if (options.signal.aborted) stop()
+  return { next, stop, ended }
+}
