@@ -6,7 +6,8 @@ description: Run an agent that turns requests from GitHub issues or Feishu chats
 # Superagent
 
 Superagent listens to GitHub and Feishu. A request that names the agent becomes a **ticket**. Each ticket runs on a
-coding agent you choose, in its own worktree, and records itself as files on disk.
+coding agent you choose, in its own worktree, and records itself as files on disk. When the agent reports it is done,
+the summary goes back as a reply in the conversation that asked.
 
 You operate an installation; you do not reimplement it. Read state with `superagent status` or by reading the files, and
 change behaviour by editing `settings.yaml`.
