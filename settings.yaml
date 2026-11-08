@@ -1,0 +1,38 @@
+# superagent configuration for this repository. State and worktrees stay out of
+# git; the file itself is kept here so an installation is one checkout.
+
+stateDir: /Users/smallnest/superagent/.superagent
+# Tickets get a worktree of this repository and open their pull requests here.
+checkout: /Users/smallnest/superagent-skill
+
+github:
+  enabled: true
+  repository: smallnest/superagent
+  cli: /Users/smallnest/.local/bin/gh-agent
+  allowed: [smallnest]
+
+feishu:
+  enabled: true
+  cli: /Users/smallnest/.local/bin/lark-bot
+  # The bot must be a member of a chat before it can hear it.
+  chats:
+    - chatId: oc_70fa3aaf77da312916dc221c9dc31eb3
+      name: Team
+  # Filled from the chat's members each round, so leaving or joining the chat
+  # is enough to change who may ask.
+  syncChat: oc_70fa3aaf77da312916dc221c9dc31eb3
+  directMessages: true
+
+executor:
+  agent: codex
+  streamIdleMs: 300
+  maxWorkers: 1
+  timeoutMinutes: 60
+  prepare: ""
+  blockedCommands: []
+
+branchPrefix: agent/
+# Commit identity and merge policy go here, in the operator's words.
+prompts: |
+  Commit as "smallnest" <smallnest@users.noreply.github.com>.
+  Do not merge the pull request; a person merges it.
