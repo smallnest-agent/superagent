@@ -90,6 +90,9 @@ mkdir ~/superagent && cd ~/superagent
 /path/to/superagent-skill/bin/superagent.js init   # writes settings.yaml here
 ```
 
+Start the loop from that directory: `superagent poll` keeps running, and `superagent poll --once` runs one round, which
+is what a cron entry calls each minute.
+
 `checkout` names the repository the tickets change, and `executor.agent` names the coding agent. Both `github` and
 `feishu` are optional, but at least one must be on.
 
