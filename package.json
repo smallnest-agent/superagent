@@ -1,9 +1,8 @@
 {
   "name": "superagent-skill",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "A headless, file-backed agent that turns requests from GitHub and Feishu into tickets and runs each ticket on a configurable coding agent: Claude Code, Codex, opencode or Gemini.",
+  "description": "A headless, file-backed agent that turns requests from GitHub issues or Feishu chats into tickets and runs each ticket on a configurable coding agent: Claude Code, Codex or opencode.",
   "bin": {
     "superagent": "./bin/superagent.js"
   },
@@ -11,7 +10,9 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm test && pnpm build"
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "prepare": "pnpm build",
+    "prepack": "tsdown"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -25,5 +26,34 @@
     "tsdown": "0.22.14",
     "typescript": "6.0.3",
     "vitest": "4.1.8"
+  },
+  "keywords": [
+    "agent",
+    "claude-code",
+    "codex",
+    "opencode",
+    "feishu",
+    "github",
+    "automation",
+    "tickets"
+  ],
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "SKILL.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smallnest/superagent.git"
+  },
+  "homepage": "https://github.com/smallnest/superagent",
+  "bugs": {
+    "url": "https://github.com/smallnest/superagent/issues"
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
   }
 }
