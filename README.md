@@ -78,9 +78,9 @@ Arbitrary polling is not yet wired, so a person runs `poll` under cron or a syst
 ## Status
 
 Done and tested: the domain, file-backed state, the settings file, three agent runners (verified against the real CLIs),
-the GitHub notification poller, the Feishu Source, worktree creation per ticket, and the round loop. Delivery of the
-agent's report back to the conversation is coded and covered by the Feishu round test; a live check against Feishu is not
-done yet.
+the GitHub notification poller, the Feishu Source, worktree creation per ticket, the round loop, and delivery of the
+agent's report back to the conversation. The Feishu path is proven with a stand-in `lark-cli`; a live check against a real
+Feishu app is not done yet.
 
 ## Tests
 
