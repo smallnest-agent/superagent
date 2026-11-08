@@ -57,6 +57,8 @@ export const SettingsSchema = z.object({
   executor: ExecutorSchema.optional().transform(value => ExecutorSchema.parse(value ?? {})),
   /** Branch names the agent pushes, as a prefix followed by the ticket's short name. */
   branchPrefix: z.string().default('agent/'),
+  /** The operator's own instructions, appended to every ticket's prompt in their words. */
+  prompts: z.string().default(''),
 })
 
 export type Settings = z.infer<typeof SettingsSchema>

@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path'
 import { mkdir, stat } from 'node:fs/promises'
 import { AGENT_NAMES, installed, reportInstructions, runnerFor, type AgentName } from './agents/index.ts'
 import { readState, FileRepositories } from './state/files.ts'
+import { runLoop } from './runner.ts'
 import { defaultSettings, readSettings, SETTINGS_FILE, writeSettings } from './settings.ts'
 
 const USAGE = `superagent — an agent that turns GitHub and Feishu requests into tickets
@@ -18,6 +19,7 @@ const USAGE = `superagent — an agent that turns GitHub and Feishu requests int
   superagent doctor [dir]          show which coding agents are installed and which one is selected
   superagent agents                list the coding agents a configuration may name
   superagent run <dir> -p <text>   run one prompt on the configured agent, in a directory it names
+  superagent poll [dir] [--once]   poll the Sources and run the tickets they bring, once or until interrupted
 
 Every command that reads an installation takes the directory that holds ${SETTINGS_FILE}.`
 
@@ -117,6 +119,24 @@ async function runOne(dir: string, prompt: string): Promise<number> {
   return result.ok ? 0 : 1
 }
 
+/** Runs the loop for one round or until interrupted, holding the state directory's lock for the whole run. */
+async function poll(dir: string, once: boolean): Promise<number> {
+  let settings
+  try { settings = await readSettings(join(dir, SETTINGS_FILE)) } catch (error) { process.stderr.write(`${(error as Error).message}\n`); return 1 }
+  const repo = new FileRepositories(settings.stateDir = settings.stateDir)
+  await repo.open()
+  const controller = new AbortController()
+  process.on('SIGINT', () => controller.abort())
+  const log = (line: string): void => { process.stdout.write(`${new Date().toISOString().slice(11, 19)} ${line}\n`) }
+  try {
+    await runLoop({ settings, repo, signal: controller.signal, log, ...once ? { once: true } : {} })
+    return 0
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n`)
+    return 1
+  } finally { await repo.flush() }
+}
+
 export async function main(argv: readonly string[]): Promise<number> {
   const [command, ...rest] = argv
   const dirOf = (index: number): string => rest[index] && !rest[index]!.startsWith('-') ? resolve(rest[index]!) : process.cwd()
@@ -125,6 +145,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     case 'status': return status(dirOf(0))
     case 'doctor': return doctor(dirOf(0))
     case 'agents': process.stdout.write(`${AGENT_NAMES.join('\n')}\n`); return 0
+    case 'poll': return poll(dirOf(0), rest.includes('--once'))
     case 'run': {
       const index = rest.indexOf('-p')
       if (index < 0 || !rest[index + 1]) { process.stderr.write(USAGE + '\n'); return 2 }

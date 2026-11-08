@@ -58,11 +58,28 @@ src/infra/     CLI wrappers, account shims, git configuration
 src/settings.ts  the settings schema and a small YAML reader
 ```
 
+## Polling
+
+```sh
+superagent poll .          # one round every github.pollSeconds until interrupted
+superagent poll . --once   # one round, for a cron job or a test
+```
+
+A round reads the agent account's GitHub notifications, keeps the ones for `github.repository` from a login on
+`github.allowed`, builds a Trigger for each mention, and accepts it as a ticket. The ticket runs on
+`executor.agent`; its report is written under `stateDir/work/<ticket>/.superagent/log.md`.
+
+Arbitrary polling is not yet wired, so a person runs `poll` under cron or a systemd timer:
+
+```cron
+*/1 * * * * cd /path/to/install && superagent poll . --once >> state/poll.log 2>&1
+```
+
 ## Status
 
-This is the foundation: the domain, the state layer, the settings file and the agent runners are done and tested. The
-GitHub and Feishu pollers and the scheduling loop are the next step; until they land, `superagent run` is how a ticket
-is started by hand.
+Done and tested: the domain, file-backed state, the settings file, three agent runners (verified against the real CLIs),
+the GitHub notification poller, and the round loop. Not yet done: the Feishu Source, worktree creation per ticket (the
+`executor.prepare` command is where an installation adds it), and delivery of the agent's report back to the conversation.
 
 ## Tests
 

@@ -26,6 +26,7 @@ State is plain JSON under `stateDir`, so `ls` and `cat` answer more than the com
 | --- | --- |
 | `state/tickets/<id>/ticket.json` | one ticket: its mandate, assignments, attention and outcome |
 | `state/tickets/<id>/log.md` | what the agent did for that ticket |
+| `stateDir/work/<id>/.superagent/log.md` | the prompt, the agent's output and its report, kept beside the worktree |
 | `state/threads/<key>.json` | one conversation, with the triggers waiting for an assessment |
 | `state/decisions/<id>.json` | why a request was accepted or ignored |
 | `state/triggers/<thread>/<at>-<id>.json` | every message a Source received |
@@ -94,6 +95,7 @@ agent writes would appear under that person's name.
 | `superagent doctor [dir]` | show installed agents and the selected one |
 | `superagent agents` | list the agent names a configuration may use |
 | `superagent run [dir] -p <text>` | run one prompt on the configured agent and print its report |
+| `superagent poll [dir] [--once]` | read GitHub notifications, accept mentions as tickets, and run them |
 
 The first argument is the installation directory and defaults to the current directory.
 
