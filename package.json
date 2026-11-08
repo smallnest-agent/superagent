@@ -1,0 +1,29 @@
+{
+  "name": "superagent-skill",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A headless, file-backed agent that turns requests from GitHub and Feishu into tickets and runs each ticket on a configurable coding agent: Claude Code, Codex, opencode or Gemini.",
+  "bin": {
+    "superagent": "./bin/superagent.js"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.0",
+    "tsdown": "0.22.14",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}
