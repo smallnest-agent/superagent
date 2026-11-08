@@ -24,7 +24,7 @@ feishu:
   directMessages: true
 
 executor:
-  agent: codex
+  agent: claude
   streamIdleMs: 300
   maxWorkers: 1
   timeoutMinutes: 60
