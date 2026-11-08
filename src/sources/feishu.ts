@@ -91,20 +91,22 @@ export function feishuTrigger(input: unknown, options: {
   }
 }
 
-/** The bot's own ids, which the Source needs to recognise a mention and to skip its own messages. */
-export async function botIdentity(cli: string, signal?: AbortSignal): Promise<{ appId: string; botId: string }> {
+/**
+ * The bot's own ids, which the Source needs to recognise a mention and to skip its own messages.
+ *
+ * The open id comes from one listened chat, because a bot that is in no chat reports none. A stream-only bot can still
+ * receive direct messages, so a chat it cannot read is not an error.
+ */
+export async function botIdentity(cli: string, chatIds: readonly string[], signal?: AbortSignal): Promise<{ appId: string; botId: string }> {
   const status = await runJson<{ appId: string }>(cli, ['config', 'show'], { signal })
-  // The bot's open id is the `bot_id` that `im chat.members bots` reports for a chat it is in; without a chat, the stream still works.
-  let botId = ''
-  try {
-    const chats = await runJson<{ chats?: Array<{ chat_id: string }> }>(cli, ['im', '+chat-list', '--page-all'], { signal })
-    const first = chats.chats?.[0]?.chat_id
-    if (first) {
-      const bots = await runJson<{ bots?: Array<{ bot_id: string }> }>(cli, ['im', 'chat.members', 'bots', '--params', JSON.stringify({ chat_id: first })], { signal })
-      botId = bots.bots?.[0]?.bot_id ?? ''
-    }
-  } catch { /* a bot with no chat yet can still receive direct messages */ }
-  return { appId: status.appId, botId }
+  for (const chatId of chatIds) {
+    try {
+      const bots = await runJson<{ bots?: Array<{ bot_id: string }> }>(cli, ['im', 'chat.members', 'bots', '--params', JSON.stringify({ chat_id: chatId })], { signal })
+      const botId = bots.bots?.find(bot => bot.bot_id)?.bot_id
+      if (botId) return { appId: status.appId, botId }
+    } catch { /* a chat the bot is not in */ }
+  }
+  return { appId: status.appId, botId: '' }
 }
 
 /** The members of a chat, which fill the allow list when `settings.feishu.syncChat` names it. */

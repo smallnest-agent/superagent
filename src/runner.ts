@@ -349,7 +349,7 @@ export async function runLoop(options: LoopOptions): Promise<void> {
   let identity = Promise.resolve({ appId: '', botId: '' })
   let identityFailed = false
   const identify = (): void => {
-    identity = botIdentity(feishu!.cli, signal).catch(error => {
+    identity = botIdentity(feishu!.cli, [...new Set([...chats.keys(), ...feishu!.syncChat ? [feishu!.syncChat] : []])], signal).catch(error => {
       if (!signal.aborted && !identityFailed) { identityFailed = true; log(`Could not read the bot's ids: ${(error as Error).message}`) }
       return { appId: '', botId: '' }
     })
