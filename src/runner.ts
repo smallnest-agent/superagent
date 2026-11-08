@@ -94,13 +94,6 @@ async function send(channel: Outbox & { drain: () => OutboundMessage[] }, clis: 
   }
 }
 
-/**
- * The loop that makes an installation run without a person: poll the Sources, assess what they bring, and run the tickets
- * the assessment accepts.
- *
- * It is a plain async loop, not a daemon protocol: `runLoop` returns when its signal aborts, so a cron job, a shell script,
- * or a coding agent can each call it for one round with `--once`.
- */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Engine, type AssessmentOutcome, type Candidate, type Executor, type Outbox, type OutboundMessage, type Policy, type Assessor, type SourceScope,
@@ -288,6 +281,13 @@ export interface LoopOptions {
   once?: boolean
 }
 
+/**
+ * The loop that makes an installation run without a person: poll the Sources, assess what they bring, and run the tickets
+ * the assessment accepts.
+ *
+ * It is a plain async loop, not a daemon protocol: `runLoop` returns when its signal aborts, so a cron job, a shell script,
+ * or a coding agent can each call it for one round with `--once`.
+ */
 /** Runs rounds until `signal` aborts; each round polls, assesses, and starts the tickets accepted. */
 export async function runLoop(options: LoopOptions): Promise<void> {
   // A round on demand ends by itself: the event stream stops with the last round, so the caller's process can exit.
